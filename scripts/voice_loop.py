@@ -1,17 +1,18 @@
 import re
+import os
+import json
 import queue
 import datetime
+import subprocess
 from pathlib import Path
 
 import numpy as np
 import noisereduce as nr
-import requests
 import sounddevice as sd
 from faster_whisper import WhisperModel
 from piper import PiperVoice
 from silero_vad import load_silero_vad, VADIterator
 
-OLLAMA_MODEL = "luna-brain"
 SAMPLE_RATE = 16000
 VAD_CHUNK_SAMPLES = 512  # required chunk size for Silero VAD at 16kHz
 
@@ -24,12 +25,51 @@ STT_MODEL = "small"
 PIPER_MODEL = "models/piper/en_US-lessac-medium.onnx"
 PIPER_CONFIG = "models/piper/en_US-lessac-medium.onnx.json"
 
+# Answers come from Luna 2.0's pipeline (brain.process: commands, knowledge base,
+# the "luna" Ollama model, Wikipedia, weather) in the sree-realtime checkout. It
+# needs that checkout's own venv, so it runs as a subprocess (scripts/brain_bridge.py).
+LUNA_MAIN = Path(os.environ.get("LUNA_MAIN", r"C:\Users\LOQ\luna-brain-main"))
+BRIDGE_PYTHON = LUNA_MAIN / "venv" / "Scripts" / "python.exe"
+BRIDGE_SCRIPT = Path(__file__).with_name("brain_bridge.py")
+REPLY_MARKER = "@@REPLY "
+
 STOP_PHRASES = {"bye", "goodbye", "good bye", "stop", "exit", "quit", "stop listening"}
 
 # Software gain applied to the raw mic signal before VAD/denoise/STT ever see it —
 # compensates for a quiet mic/room without needing to touch Windows input settings.
 # Raise if it's still missing quieter speech, lower if quiet parts start clipping/distorting.
 MIC_GAIN = 2.5
+
+# Noise reduction before Whisper. Set LUNA_DENOISE=0 to compare without it — on a
+# quiet room it can remove parts of the voice along with the noise.
+DENOISE = os.environ.get("LUNA_DENOISE", "1") != "0"
+
+# The last utterance is saved before and after denoising, so you can listen to
+# exactly what Whisper was given when it mishears something.
+DEBUG_RAW_WAV = Path("logs/last_heard_raw.wav")
+DEBUG_CLEAN_WAV = Path("logs/last_heard_clean.wav")
+
+
+def save_wav(path, audio):
+    import wave
+    path.parent.mkdir(exist_ok=True)
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767).astype(np.int16)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(pcm.tobytes())
+
+
+def report_level(audio):
+    """Warn when MIC_GAIN pushes speech into clipping — clipped audio is
+    distorted and Whisper mishears it."""
+    peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    clipped = float(np.mean(np.abs(audio) >= 0.999)) if len(audio) else 0.0
+    if clipped > 0.005:
+        print(f"(mic too loud: {clipped:.1%} of the audio clipped — lower MIC_GAIN)")
+    elif peak < 0.1:
+        print(f"(mic very quiet: peak {peak:.2f} — raise MIC_GAIN or move closer)")
 
 # Whisper's base.en model reliably mangles names and acronyms it hasn't seen (e.g. it
 # heard "TKM" as "P.K.M." and "Aneesh G Nath" as "Anish G. Nuth" in testing). Passing
@@ -39,169 +79,11 @@ DOMAIN_VOCABULARY = (
     "Kilikollur, Dr. Aneesh G Nath, Dr. Dimple A Shajahan, Dr. Thushara A, "
     "Dr. Manu J Pillai, Dr. Anantha Padmanabhan N K, Dr. Shyna A, Dr. Reshma Sheik, "
     "Reena Mary George, Rehannara Begum T, Dr. Jini Raju, B. Mohammed Siyad, Nisa A K, "
-    "Dr. Shameem Ansar, NAAC, KIRF, NBA, KTU, CGPU, HOD, Luna, Michael Harold Sony, "
-    "Sreenandana, Devadathan, Raspberry Pi."
+    "Dr. Shameem Ansar, Dr. Sadiq A, NAAC, KIRF, NBA, KTU, CGPU, HOD, Luna, "
+    "Michael Harold Sony, Sreenandana, Devadathan, Raspberry Pi."
 )
-
-# Campus location (Kollam), hardcoded so weather lookups skip a geocoding round-trip.
-WEATHER_LOCATION_NAME = "Kollam"
-WEATHER_LAT, WEATHER_LON = 8.8932, 76.6141
-
-# WMO weather codes used by Open-Meteo's current_weather field, collapsed to plain
-# spoken descriptions. https://open-meteo.com/en/docs has the full table.
-WMO_WEATHER_DESCRIPTIONS = {
-    0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
-    45: "foggy", 48: "foggy with frost",
-    51: "light drizzle", 53: "drizzle", 55: "dense drizzle",
-    61: "light rain", 63: "rain", 65: "heavy rain",
-    66: "light freezing rain", 67: "freezing rain",
-    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
-    80: "light rain showers", 81: "rain showers", 82: "violent rain showers",
-    85: "light snow showers", 86: "heavy snow showers",
-    95: "thunderstorm", 96: "thunderstorm with light hail", 99: "thunderstorm with heavy hail",
-}
-
-# Wikipedia's API rejects requests without a descriptive User-Agent (returns 403).
-WIKIPEDIA_HEADERS = {"User-Agent": "LunaVoiceAssistant/1.0 (offline campus assistant; contact: n/a)"}
 
 LOG_PATH = Path("logs/voice_session.log")
-
-_DATE_RE = re.compile(r"\b(what('?s| is) the )?(date|day)\b", re.IGNORECASE)
-_TIME_RE = re.compile(r"\bwhat('?s| is) the time\b|\bwhat time\b", re.IGNORECASE)
-_WEATHER_RE = re.compile(r"\bweather\b|\bhow(’|')?s it (looking|outside)\b|\bis it raining\b", re.IGNORECASE)
-
-# Luna's refusals come in different flavors (see data/train_data.jsonl), and only one of
-# them is safe to hand to the web fallback. "Didn't catch that" means the STT transcript
-# itself may be garbage — searching it risks a spurious match on gibberish. Refusals that
-# name a specific entity type ("...by that name", "...about that person", "...about the
-# X department") mean Luna recognizes this as a question about a specific named thing in
-# her domain that she doesn't have — that thing very likely doesn't exist (see: the
-# P.K.M. college test earlier), and Wikipedia's keyword search will confidently return
-# *something* for almost any query, so falling back there just re-introduces confident
-# wrong answers instead of an honest "I don't know" for made-up local entities. Only the
-# fully generic "I don't have that information" — a genuine open-domain knowledge gap
-# (capital of France, quantum entanglement) — is safe to look up.
-_GARBLED_MARKERS = ("didn't catch that", "did not catch that")
-_CAPABILITY_REFUSAL_MARKERS = ("i can't do that", "i cannot do that")
-_ENTITY_REFUSAL_MARKERS = ("by that name", "about that person", "about the")
-_GENERIC_UNKNOWN_MARKERS = ("i don't have that information", "i do not have that information")
-
-
-# Relying only on which refusal phrasing the fine-tuned model happens to pick is too
-# fragile — it sometimes gives the fully generic refusal even for a campus-domain
-# question (e.g. "Tell me about the chemistry department" got the generic "I don't have
-# that information" instead of an entity-specific refusal), which would otherwise pass
-# the check above. As a second, more reliable guard: if the *question itself* mentions
-# campus-domain vocabulary, treat it as almost certainly about this specific campus, not
-# real-world general knowledge — a generic real Wikipedia article that happens to share
-# those words (a different college, a different department) is a false-confidence risk,
-# not a genuine answer.
-_DOMAIN_ADJACENT_TERMS = re.compile(
-    r"\b(department|college|campus|hod|advisor|professor|faculty|principal|hostel|club|"
-    r"fest|placement|lab|laboratory|canteen|library|hall|office|dean|lecturer|staff)\b",
-    re.IGNORECASE,
-)
-
-
-def should_try_web_fallback(query, reply):
-    if _DOMAIN_ADJACENT_TERMS.search(query):
-        return False
-    lowered = reply.lower()
-    if any(m in lowered for m in _GARBLED_MARKERS + _CAPABILITY_REFUSAL_MARKERS + _ENTITY_REFUSAL_MARKERS):
-        return False
-    return any(m in lowered for m in _GENERIC_UNKNOWN_MARKERS)
-
-
-def is_datetime_question(text):
-    return bool(_DATE_RE.search(text) or _TIME_RE.search(text))
-
-
-def answer_datetime(text):
-    now = datetime.datetime.now()
-    wants_time = bool(_TIME_RE.search(text))
-    wants_date = bool(_DATE_RE.search(text))
-    if wants_time and not wants_date:
-        return f"It's {now.strftime('%I:%M %p').lstrip('0')}."
-    if wants_date and not wants_time:
-        return f"It's {now.strftime('%A, %B %d, %Y')}."
-    return f"It's {now.strftime('%A, %B %d, %Y')}, {now.strftime('%I:%M %p').lstrip('0')}."
-
-
-def is_weather_question(text):
-    return bool(_WEATHER_RE.search(text))
-
-
-def answer_weather():
-    """Live current-weather lookup for the campus location via Open-Meteo (free, no API
-    key). Requires internet — this is the one place voice_loop.py depends on a network
-    connection; if the request fails, we say so honestly rather than guessing."""
-    try:
-        r = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={"latitude": WEATHER_LAT, "longitude": WEATHER_LON, "current_weather": "true"},
-            timeout=5,
-        )
-        r.raise_for_status()
-        current = r.json()["current_weather"]
-        description = WMO_WEATHER_DESCRIPTIONS.get(current["weathercode"], "unclear conditions")
-        temp_c = round(current["temperature"])
-        return f"It's currently {temp_c} degrees Celsius in {WEATHER_LOCATION_NAME}, with {description}."
-    except Exception:
-        return "Sorry, I couldn't reach the weather service right now."
-
-
-# Wikipedia's search index ranks on keywords, not natural-language questions — leaving
-# interrogative phrasing in (see: "What is the capital of France?" matching the article
-# "Closed-ended question" ahead of "France") measurably hurts relevance. Stripping the
-# question wrapper down to its keywords before searching fixes that in testing.
-_QUESTION_PREFIX_RE = re.compile(
-    r"^(what('?s| is| are)|who('?s| is| are)|where('?s| is| are)|when('?s| is| are)|"
-    r"why('?s| is| are)|how('?s| is| are)|tell me about|can you tell me)\s+(the\s+)?",
-    re.IGNORECASE,
-)
-
-
-def _to_search_keywords(query):
-    stripped = _QUESTION_PREFIX_RE.sub("", query).strip()
-    return stripped.rstrip("?").strip() or query
-
-
-def web_fallback(query):
-    """Best-effort general-knowledge lookup via Wikipedia's free, no-key API, used only
-    when Luna's fine-tuned model has no domain answer. This is not a real search engine —
-    it only helps for encyclopedic/factual questions, not opinions or current events, and
-    fails closed (returns None) on anything else so the caller can keep the honest refusal
-    instead of speaking nothing or an error."""
-    try:
-        search = requests.get(
-            "https://en.wikipedia.org/w/api.php",
-            params={"action": "query", "list": "search", "srsearch": _to_search_keywords(query),
-                     "format": "json", "srlimit": 1},
-            headers=WIKIPEDIA_HEADERS,
-            timeout=5,
-        )
-        search.raise_for_status()
-        hits = search.json()["query"]["search"]
-        if not hits:
-            return None
-        title = hits[0]["title"]
-
-        summary = requests.get(
-            f"https://en.wikipedia.org/api/rest_v1/page/summary/{requests.utils.quote(title)}",
-            headers=WIKIPEDIA_HEADERS,
-            timeout=5,
-        )
-        summary.raise_for_status()
-        extract = summary.json().get("extract", "").strip()
-        if not extract:
-            return None
-
-        # Keep spoken replies short — Piper will read the whole string aloud, and a full
-        # Wikipedia summary paragraph is too long for a voice answer.
-        sentences = re.split(r"(?<=[.!?])\s+", extract)
-        return " ".join(sentences[:2])
-    except Exception:
-        return None
 
 
 def log_exchange(heard, reply):
@@ -217,7 +99,8 @@ def log_exchange(heard, reply):
 # This is a starting guess at what should be spelled out — adjust freely, and note
 # some (like IEEE) have an idiomatic spoken form ("eye triple ee") rather than a
 # strict letter-by-letter one if you want to hand-tune those further.
-ACRONYMS = ["TKM", "NAAC", "NBA", "KIRF", "KTU", "CGPU", "HOD", "IEEE", "ISTE", "IEI", "CSI", "LPA", "PIN"]
+ACRONYMS = ["TKM", "NAAC", "NBA", "KIRF", "KTU", "CGPU", "HOD", "IEEE", "ISTE", "IEI", "CSI", "LPA",
+            "PIN", "IQAC", "AICTE", "MCA", "CSE", "ECE", "EEE", "IEDC", "CCF", "NIRF", "UGC"]
 _ACRONYM_RE = re.compile(r"\b(" + "|".join(re.escape(a) for a in ACRONYMS) + r")\b")
 
 
@@ -239,15 +122,55 @@ def is_stop_phrase(text):
     return normalized in STOP_PHRASES or (len(words) <= 3 and words[-1] in {"bye", "stop", "exit", "quit"})
 
 
-def ask_luna(text):
-    r = requests.post(
-        "http://localhost:11434/api/generate",
-        json={"model": OLLAMA_MODEL, "prompt": text, "stream": False},
-    )
-    body = r.json()
-    if "response" not in body:
-        return f"(Ollama error: {body.get('error', body)})"
-    return body["response"].strip()
+class BrainBridge:
+    """One long-lived brain_bridge.py subprocess: a question per line in, a
+    REPLY_MARKER-prefixed JSON line out. Its other output (brain's own logs)
+    is echoed so you can see which path answered."""
+
+    def __init__(self):
+        env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+        self.proc = subprocess.Popen(
+            [str(BRIDGE_PYTHON), "-u", str(BRIDGE_SCRIPT)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace", env=env, bufsize=1,
+        )
+        self._read_reply()           # blocks until brain + the LLM are loaded
+
+    def _read_reply(self):
+        for line in self.proc.stdout:
+            if line.startswith(REPLY_MARKER):
+                return json.loads(line[len(REPLY_MARKER):])
+            print(f"  | {line.rstrip()}")
+        raise RuntimeError("Luna's brain process exited — see the log lines above.")
+
+    def ask(self, text):
+        self.proc.stdin.write(text.replace("\n", " ") + "\n")
+        self.proc.stdin.flush()
+        return self._read_reply()["reply"]
+
+    def close(self):
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=10)
+        except Exception:
+            self.proc.kill()
+
+
+# Only these languages are allowed. Free auto-detection mislabels Indian-accented
+# English as Arabic, Tamil or Urdu (seen in testing) and then transcribes it in
+# that script; restricting the choice to English or Malayalam keeps both working.
+ALLOWED_LANGUAGES = ("en", "ml")
+
+
+def transcribe(stt, audio):
+    segments, info = stt.transcribe(audio, initial_prompt=DOMAIN_VOCABULARY)
+    if info.language not in ALLOWED_LANGUAGES:
+        # segments is a lazy generator, so discarding it costs nothing.
+        probs = dict(info.all_language_probs or [])
+        language = max(ALLOWED_LANGUAGES, key=lambda lang: probs.get(lang, 0.0))
+        segments, info = stt.transcribe(audio, language=language,
+                                        initial_prompt=DOMAIN_VOCABULARY)
+    return " ".join(seg.text for seg in segments).strip()
 
 
 def speak(tts, text):
@@ -286,6 +209,9 @@ def drain_queue(audio_queue):
 
 
 def main():
+    print("Loading Luna's brain (knowledge base + luna model)...")
+    brain = BrainBridge()
+
     print("Loading speech-to-text model...")
     stt = WhisperModel(STT_MODEL, device="cpu", compute_type="int8")
 
@@ -310,65 +236,56 @@ def main():
         blocksize=VAD_CHUNK_SAMPLES, callback=callback,
     )
 
+    print(f"Noise reduction: {'on' if DENOISE else 'off'}, mic gain: {MIC_GAIN}")
     print("Luna voice loop ready. Speak any time; say 'bye' or 'stop' to exit.\n")
-    with stream:
-        speak(tts, "Hi, I'm listening.")
-        # The mic picks up Luna's own greeting through the speakers; without this,
-        # that echo gets transcribed as the first "utterance" from the user.
-        drain_queue(audio_queue)
-        vad_iterator.reset_states()
-        while True:
-            audio = listen_for_utterance(audio_queue, vad_iterator)
-
-            # Denoise before transcription — helps separate the speaker from steady
-            # background noise (fans, hum, room tone). prop_decrease < 1.0 keeps this
-            # gentle so it doesn't eat quieter speech along with the noise.
-            try:
-                audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE, stationary=False, prop_decrease=0.6)
-            except Exception as e:
-                print(f"(denoise skipped: {e})")
-
-            # No forced language: auto-detect per utterance so English and Malayalam
-            # (and code-switching between them, common in campus speech) both transcribe
-            # in their own script instead of Malayalam being mis-read as English.
-            segments, _info = stt.transcribe(audio, initial_prompt=DOMAIN_VOCABULARY)
-            heard = " ".join(seg.text for seg in segments).strip()
-
-            # Discard whatever the mic picked up while Luna was talking, and reset
-            # VAD state, so playback audio can't be misread as the next utterance.
+    try:
+        with stream:
+            speak(tts, "Hi, I'm listening.")
+            # The mic picks up Luna's own greeting through the speakers; without this,
+            # that echo gets transcribed as the first "utterance" from the user.
             drain_queue(audio_queue)
             vad_iterator.reset_states()
+            while True:
+                audio = listen_for_utterance(audio_queue, vad_iterator)
 
-            if not heard:
-                continue
+                # Denoise before transcription — helps separate the speaker from steady
+                # background noise (fans, hum, room tone). prop_decrease < 1.0 keeps this
+                # gentle so it doesn't eat quieter speech along with the noise.
+                report_level(audio)
+                save_wav(DEBUG_RAW_WAV, audio)
+                if DENOISE:
+                    try:
+                        audio = nr.reduce_noise(y=audio, sr=SAMPLE_RATE, stationary=False, prop_decrease=0.6)
+                    except Exception as e:
+                        print(f"(denoise skipped: {e})")
+                save_wav(DEBUG_CLEAN_WAV, audio)
 
-            print(f"You said: {heard}")
+                heard = transcribe(stt, audio)
 
-            if is_stop_phrase(heard):
-                log_exchange(heard, "(stop phrase — session ended)")
-                speak(tts, "Goodbye.")
+                # Discard whatever the mic picked up while Luna was talking, and reset
+                # VAD state, so playback audio can't be misread as the next utterance.
                 drain_queue(audio_queue)
-                break
+                vad_iterator.reset_states()
 
-            # Date/time and weather are answered directly instead of going through the
-            # fine-tuned model — they're not domain facts it was trained on, and date/time
-            # in particular needs no network round-trip at all.
-            if is_datetime_question(heard):
-                reply = answer_datetime(heard)
-            elif is_weather_question(heard):
-                reply = answer_weather()
-            else:
-                reply = ask_luna(heard)
-                if should_try_web_fallback(heard, reply):
-                    fallback = web_fallback(heard)
-                    if fallback:
-                        reply = fallback
+                if not heard:
+                    continue
 
-            print(f"Luna: {reply}\n")
-            log_exchange(heard, reply)
-            speak(tts, reply)
-            drain_queue(audio_queue)
-            vad_iterator.reset_states()
+                print(f"You said: {heard}")
+
+                if is_stop_phrase(heard):
+                    log_exchange(heard, "(stop phrase — session ended)")
+                    speak(tts, "Goodbye.")
+                    drain_queue(audio_queue)
+                    break
+
+                reply = brain.ask(heard)
+                print(f"Luna: {reply}\n")
+                log_exchange(heard, reply)
+                speak(tts, reply)
+                drain_queue(audio_queue)
+                vad_iterator.reset_states()
+    finally:
+        brain.close()
 
 
 if __name__ == "__main__":
