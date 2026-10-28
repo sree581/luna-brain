@@ -22,3 +22,6 @@ logs/
 
 # Editor-local settings.
 .vscode/
+
+# API keys (SARVAM_API_KEY etc.) — never commit these. See .env.example.
+.env

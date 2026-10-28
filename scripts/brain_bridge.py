@@ -21,8 +21,19 @@ import llm_local  # noqa: E402
 _said = []
 
 
+# "Hmm, let me think." while the model is slow: spoken live by the robot,
+# but here it would only be glued onto the front of the reply.
+try:
+    from config import LLM_FILLERS
+except ImportError:
+    LLM_FILLERS = ()
+_FILLERS = {f.strip().lower() for f in LLM_FILLERS}
+
+
 def _capture(x, *a, **k):
-    _said.append(x if isinstance(x, str) else "".join(x))
+    text = x if isinstance(x, str) else "".join(x)
+    if text.strip().lower() not in _FILLERS:
+        _said.append(text)
 
 
 brain.speak = _capture           # voice_loop.py does the speaking
